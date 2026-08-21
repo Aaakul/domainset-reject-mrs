@@ -145,11 +145,14 @@ jobs:
       - name: Check for changes
         id: diff
         run: |
-          git diff --quiet \
-            List/skk_domainset_reject_base.mrs \
-            List/skk_domainset_reject_with_extra.mrs \
-            && echo "changed=false" >> "$GITHUB_OUTPUT" \
-            || echo "changed=true" >> "$GITHUB_OUTPUT"
+          if git status --porcelain \
+               List/skk_domainset_reject_base.mrs \
+               List/skk_domainset_reject_with_extra.mrs \
+             | grep -q .; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Commit and push updated rule sets
         if: steps.diff.outputs.changed == 'true'
