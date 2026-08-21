@@ -1,0 +1,171 @@
+name: Update SKK List
+
+# Runs daily at 02:00 UTC, or on manual dispatch.
+on:
+  schedule:
+    - cron: "0 2 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  MIHOMO_VERSION: "v1.19.30"
+  MIHOMO_SHA256: "cf06ce2c7d1421bdbda14ee4a5b6046672dc35ebf8eecd8e77504ec3c0ed9a84"
+  MIHOMO_ASSET: "mihomo-linux-amd64-v1.19.30.gz"
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Cache Mihomo binary ─────────────────────────────────────────────
+      - name: Cache Mihomo binary
+        id: cache-mihomo
+        uses: actions/cache@v4
+        with:
+          path: /usr/local/bin/mihomo
+          key: mihomo-${{ env.MIHOMO_VERSION }}-linux-amd64
+
+      # ── 3. Download and install Mihomo (cache miss only) ───────────────────
+      - name: Download Mihomo binary
+        if: steps.cache-mihomo.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+
+          DOWNLOAD_URL="https://github.com/MetaCubeX/mihomo/releases/download/${MIHOMO_VERSION}/${MIHOMO_ASSET}"
+          echo "Downloading Mihomo ${MIHOMO_VERSION} from ${DOWNLOAD_URL}"
+
+          curl -fsSL -o mihomo.gz "${DOWNLOAD_URL}"
+
+          # Verify SHA256
+          echo "${MIHOMO_SHA256}  mihomo.gz" | sha256sum --check --status
+          echo "SHA256 verified."
+
+          gunzip mihomo.gz
+          chmod +x mihomo
+          mv mihomo /usr/local/bin/mihomo
+
+      - name: Verify Mihomo binary
+        run: mihomo version
+
+      # ── 4. Download SKK domain lists ───────────────────────────────────────
+      - name: Download reject.conf
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            -o reject.conf \
+            "https://ruleset.skk.moe/List/domainset/reject.conf"
+
+      - name: Download reject_extra.conf
+        run: |
+          set -euo pipefail
+          curl -fsSL \
+            -o reject_extra.conf \
+            "https://ruleset.skk.moe/List/domainset/reject_extra.conf"
+
+      # ── 5. Validate downloaded files ───────────────────────────────────────
+      - name: Validate reject.conf
+        run: |
+          set -euo pipefail
+
+          if [ ! -s reject.conf ]; then
+            echo "ERROR: reject.conf is empty or missing." >&2
+            exit 1
+          fi
+
+          # Count non-empty, non-comment lines
+          DOMAIN_COUNT=$(grep -cv '^\s*#\|^\s*$' reject.conf || true)
+          if [ "${DOMAIN_COUNT}" -lt 10 ]; then
+            echo "ERROR: reject.conf contains too few domain entries (${DOMAIN_COUNT}). Possible download failure." >&2
+            exit 1
+          fi
+          echo "reject.conf OK: ${DOMAIN_COUNT} domain entries."
+
+      - name: Validate reject_extra.conf
+        run: |
+          set -euo pipefail
+
+          if [ ! -s reject_extra.conf ]; then
+            echo "ERROR: reject_extra.conf is empty or missing." >&2
+            exit 1
+          fi
+
+          DOMAIN_COUNT=$(grep -cv '^\s*#\|^\s*$' reject_extra.conf || true)
+          if [ "${DOMAIN_COUNT}" -lt 10 ]; then
+            echo "ERROR: reject_extra.conf contains too few domain entries (${DOMAIN_COUNT}). Possible download failure." >&2
+            exit 1
+          fi
+          echo "reject_extra.conf OK: ${DOMAIN_COUNT} domain entries."
+
+      # ── 6. Prepare merged list for "with_extra" ruleset ────────────────────
+      - name: Merge reject.conf + reject_extra.conf
+        run: |
+          set -euo pipefail
+          cat reject.conf reject_extra.conf > reject_combined.conf
+          echo "Merged file size: $(wc -l < reject_combined.conf) lines."
+
+      # ── 7. Convert to MRS ──────────────────────────────────────────────────
+      - name: Create output directory
+        run: mkdir -p List
+
+      - name: Convert reject.conf → skk_domainset_reject_base.mrs
+        run: |
+          set -euo pipefail
+          mihomo convert-ruleset domain text \
+            reject.conf \
+            List/skk_domainset_reject_base.mrs
+          echo "Base MRS size: $(wc -c < List/skk_domainset_reject_base.mrs) bytes."
+
+      - name: Convert reject_combined.conf → skk_domainset_reject_with_extra.mrs
+        run: |
+          set -euo pipefail
+          mihomo convert-ruleset domain text \
+            reject_combined.conf \
+            List/skk_domainset_reject_with_extra.mrs
+          echo "With-extra MRS size: $(wc -c < List/skk_domainset_reject_with_extra.mrs) bytes."
+
+      # ── 8. Validate generated MRS files ───────────────────────────────────
+      - name: Validate generated MRS files
+        run: |
+          set -euo pipefail
+
+          for mrs_file in \
+            List/skk_domainset_reject_base.mrs \
+            List/skk_domainset_reject_with_extra.mrs; do
+            if [ ! -s "${mrs_file}" ]; then
+              echo "ERROR: ${mrs_file} is empty or was not generated." >&2
+              exit 1
+            fi
+            echo "${mrs_file}: $(wc -c < "${mrs_file}") bytes — OK."
+          done
+
+      # ── 9. Commit if changed ───────────────────────────────────────────────
+      - name: Check for changes
+        id: diff
+        run: |
+          git diff --quiet \
+            List/skk_domainset_reject_base.mrs \
+            List/skk_domainset_reject_with_extra.mrs \
+            && echo "changed=false" >> "$GITHUB_OUTPUT" \
+            || echo "changed=true" >> "$GITHUB_OUTPUT"
+
+      - name: Commit and push updated rule sets
+        if: steps.diff.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add \
+            List/skk_domainset_reject_base.mrs \
+            List/skk_domainset_reject_with_extra.mrs
+          git commit -m "chore: update skk rule sets"
+          git push
+
+      - name: No changes detected
+        if: steps.diff.outputs.changed == 'false'
+        run: echo "Rule sets are up to date. No commit needed."
